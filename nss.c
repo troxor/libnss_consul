@@ -15,8 +15,23 @@
 #include <curl/curl.h>
 #include <json-c/json.h>
 
+#define CONSUL_URL_BASE "http://127.0.0.1:8500/v1/catalog/service/"
+
 #define BUFFER_SIZE (256*1024) // 256kB
 #define MAX_ENTRIES 16
+
+#define ALIGN(idx) do { \
+  if (idx % sizeof(void*)) \
+    idx += (sizeof(void*) - idx % sizeof(void*)); /* Align on 32 bit boundary */ \
+} while(0)
+
+typedef struct {
+	uint32_t address;
+} ipv4_address_t;
+
+typedef struct {
+	uint8_t address[16];
+} ipv6_address_t;
 
 struct userdata {
 	int count;
@@ -27,6 +42,25 @@ struct userdata {
 		char *name[MAX_ENTRIES];
 	} data;
 };
+
+struct curl_write_result {
+	char *data;
+	int pos;
+};
+
+static size_t curl_write(char *ptr, size_t size, size_t nmemb, void *userdata) {
+	struct curl_write_result *result = (struct curl_write_result *)userdata;
+
+	if (result->pos + size * nmemb >= BUFFER_SIZE - 1) {
+		fprintf(stderr, "buffer fail\n");
+		return 1;
+	}
+
+	memcpy(result->data + result->pos, ptr, size * nmemb);
+	result->pos += size * nmemb;
+
+	return size * nmemb;
+}
 
 static int ends_with(const char *name, const char* suffix) {
 	size_t ln, ls;
@@ -43,8 +77,11 @@ static int ends_with(const char *name, const char* suffix) {
  * Packs the data from a name/value string into a hostent return
  * struct. "result" must be previously initialized.
  */
-static void pack_hostent( /* OUT */ struct hostent *result, char *buffer,
-			 size_t buflen, const char *name, const void *addr)
+static void pack_hostent(struct hostent *result,
+			 char *buffer,
+			 size_t buflen,
+			 const char *name,
+			 const void *addr)
 {
 	char *aliases, *r_addr, *addrlist;
 	size_t l, idx;
@@ -57,7 +94,7 @@ static void pack_hostent( /* OUT */ struct hostent *result, char *buffer,
 	memcpy(result->h_name, name, l);
 	buffer[l] = '\0';
 
-	idx = ALIGN(l + 1);
+	/*idx = ALIGN(l + 1);*/
 
 	/* 2nd, the empty aliases array */
 	aliases = buffer + idx;
@@ -72,7 +109,7 @@ static void pack_hostent( /* OUT */ struct hostent *result, char *buffer,
 	/* 3rd, address */
 	r_addr = buffer + idx;
 	inet_pton(AF_INET, addr, r_addr);
-	idx += ALIGN(result->h_length);
+	//idx += ALIGN(result->h_length);
 
 	/* 4th, the addresses ptr array */
 	addrlist = buffer + idx;
@@ -83,103 +120,76 @@ static void pack_hostent( /* OUT */ struct hostent *result, char *buffer,
 }
 
 
-/**
- * Resolves the hostname into an IP address. Not really re-entrant. This
- * function will be called multiple times by the GNU C library to get the
- * entire list of addresses.
- * This function spec is defined at http://www.gnu.org/software/libc/manual/html_node/NSS-Module-Function-Internals.html
+/*
+ * Given a service name, queries Consul API and returns numeric address
  */
-enum nss_status _nss_consul_gethostbyname2_r(const char *name, int af,
-					     /* OUT */
-					     struct hostent *result,
-					     char *buffer, size_t buflen,
-					     /* OUT */ int *errnop,
-					     /* OUT */ int *h_errnop)
-{
+int curl_lookup(const char *name) {
 
-	int pid, pipes[2], rv;	/* For hardcore forking action later. */
-	char addr[256];
-	int last_err;		/* Just in case we need to perror(3). */
-	char **args;
+	printf( "@ %s\n", __FUNCTION__ ) ;
 
-	/* Only IPv4 addresses make sense for this resolver. */
-	if (af != AF_INET) {
-		*errnop = EAFNOSUPPORT;
-		*h_errnop = NO_DATA;
-		return NSS_STATUS_UNAVAIL;
+	CURL *curl_handle = curl_easy_init();
+	CURLcode res;
+
+	char *curl_data;
+	char *consul_url;
+	const char *addr;
+	size_t cu_len1, cu_len2;
+
+	/* Create API URL given *name */
+	curl_data = malloc(BUFFER_SIZE);
+	cu_len1 = strlen(CONSUL_URL_BASE);
+	cu_len2 = strlen(name);
+	consul_url = malloc(cu_len1+cu_len2+1);
+	memcpy(consul_url, CONSUL_URL_BASE, cu_len1);
+	memcpy(consul_url+cu_len1, name, cu_len2);
+
+	struct curl_write_result wr = {
+		.data = curl_data,
+		.pos = 0
+	};
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, consul_url);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, curl_write);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &wr);
+	res = curl_easy_perform(curl_handle);
+	curl_data[wr.pos] = '\0';
+
+	// Parse out the address field only
+	// For now it's lame and only grabs the first one until FIXME
+	json_object *jservicearray = json_tokener_parse(curl_data);
+	json_object *jservice, *jaddr;
+	jaddr = malloc(50); // this is dumb
+	enum json_type type;
+	int i;
+	for (i=0; i < json_object_array_length(jservicearray) ; i++) {
+		jservice = json_object_array_get_idx(jservicearray, i);
+
+		// We care about the address
+		json_object_object_get_ex(jservice, "Address", &jaddr);
+		addr = json_object_get_string(jaddr);
+		printf("addr %s\n", addr);
 	}
+	
+	free(curl_data);
+	curl_easy_cleanup(curl_handle);
+	curl_global_cleanup();
 
-	pipe(pipes);
-	if (0 == (pid = fork())) {
-		args = (char **) calloc(sizeof(char *), 4);
-		if (args < 0)
-			goto CHILD_ERR;
-				   /** Dijkstra can suck it. */
-
-		args[0] = (char *) calloc(sizeof(char), 8);
-		strcpy(args[0], "etcdctl");
-		args[1] = (char *) calloc(sizeof(char), 4);
-		strcpy(args[1], "get");
-		args[2] = (char *) calloc(sizeof(char), strlen(name) + 7);
-		strcpy(args[2], "/hosts/");
-		strcpy(args[2] + 7, name);
-		args[3] = NULL;
-
-		/* Child code */
-		close(pipes[0]);
-		close(0);
-		close(2);
-		dup2(pipes[1], 1);
-		execvp("etcdctl", args);
-
-	      CHILD_ERR:
-		last_err = errno;
-		perror("etcdctl");
-		exit(last_err);	/* Couldn't exec. */
-	} else if (pid > 0) {
-		/* Parent code */
-		close(pipes[1]);
-
-		if (0 > read(pipes[0], addr, 255)) {
-			last_err = errno;
-			perror("read");
-			*errnop = last_err;
-			*h_errnop = NO_DATA;
-			return NSS_STATUS_NOTFOUND;
-		} else {
-			int len = strlen(addr);
-			addr[len - 1] = '\0';
-		}
-
-		waitpid(pid, &rv, 0);
-
-		if (rv) {
-			/* Host wasn't found or etcdctl failed spectacularly. */
-			*errnop = ENOENT;
-			*h_errnop = HOST_NOT_FOUND;
-			return NSS_STATUS_NOTFOUND;
-		}
-	} else {
-		/* Error forking. */
-		last_err = errno;
-		perror("fork");
-		*errnop = last_err;
-		*h_errnop = NO_DATA;
-		return NSS_STATUS_UNAVAIL;
-	}
-
-	pack_hostent(result, buffer, buflen, name, addr);
-
-	return NSS_STATUS_SUCCESS;
+	
 }
 
 
+/*
+ * Passes through to ..._gethostbyname2
+ */
 enum nss_status _nss_consul_gethostbyname_r(const char *name,
 					    struct hostent *result,
-					    char *buffer, size_t buflen,
+					    char *buffer,
+					    size_t buflen,
 					    int *errnop,
 					    int *h_errnop)
 {
+	printf( "@ %s\n", __FUNCTION__ ) ;
+
 	return _nss_consul_gethostbyname2_r(name,
 					    AF_INET,
 					    result,
@@ -189,7 +199,59 @@ enum nss_status _nss_consul_gethostbyname_r(const char *name,
 					    h_errnop);
 }
 
+/*
+ * Resolves the hostname into an IP address.
+ * This function will be called multiple times by the GNU C library to get
+ * get entire list of addresses.
+ *
+ * This function spec is defined at http://www.gnu.org/software/libc/manual/html_node/NSS-Module-Function-Internals.html
+ */
+enum nss_status _nss_consul_gethostbyname2_r(const char *name,
+					     int af,
+					     struct hostent *result,
+					     char *buffer,
+					     size_t buflen,
+					     int *errnop,
+					     int *h_errnop)
+{
+	printf( "@ %s\n", __FUNCTION__ ) ;
 
+	// error checking is for pansies
+	if (af != AF_INET || af != AF_INET6) {
+		*errnop = EAGAIN;
+		*h_errnop = NO_RECOVERY;
+		return NSS_STATUS_TRYAGAIN;
+	}
+	// i am a pansy
+	if (!ends_with(name, ".service.consul")) {
+		*errnop = EINVAL;
+		*h_errnop = NO_RECOVERY;
+		return NSS_STATUS_UNAVAIL;
+	}
+	// ∴ error checking is for me
+	if (buflen < (sizeof(char*) + 
+		      strlen(name) + 1 +
+		      sizeof(ipv4_address_t) +
+		      sizeof(char*) + 
+		      8 )) {
+		*errnop = ERANGE;
+		*h_errnop = NO_RECOVERY;
+		return NSS_STATUS_TRYAGAIN;
+	}
+
+	result->h_addrtype = AF_INET;
+	result->h_length = sizeof(ipv4_address_t);
+	
+	//result->h_name = 'c';
+	
+		
+
+	return NSS_STATUS_SUCCESS;
+}
+
+/*
+ * not implemented
+ */
 enum nss_status _nss_etcd_gethostbyaddr_r(const void *addr, socklen_t len,
 					  int af,
 					  struct hostent *result,
@@ -197,5 +259,6 @@ enum nss_status _nss_etcd_gethostbyaddr_r(const void *addr, socklen_t len,
 					  int *errnop,
 					  int *h_errnop)
 {
+	printf( "@ %s\n", __FUNCTION__ ) ;
 	return NSS_STATUS_UNAVAIL;
 }
