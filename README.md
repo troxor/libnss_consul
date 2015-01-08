@@ -25,3 +25,17 @@ Then, include "consul" in your /etc/nsswitch.conf files section:
 hosts = files consul dns
 ...
 ```
+
+Status
+------
+
+"code sucks, but works-- barely"
+
+
+Missing features/Limitations
+----------------------------
+ * Only one IP address returned for a service
+ * No IPv6 yet
+ * ???
+ * ???
+
