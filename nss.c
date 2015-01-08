@@ -15,15 +15,18 @@
 #include <curl/curl.h>
 #include <json-c/json.h>
 
+#define DEBUG 0
 #define CONSUL_URL_BASE "http://127.0.0.1:8500/v1/catalog/service/"
 
 #define BUFFER_SIZE (256*1024) // 256kB
 #define MAX_ENTRIES 16
 
-#define ALIGN(idx) do { \
-  if (idx % sizeof(void*)) \
-    idx += (sizeof(void*) - idx % sizeof(void*)); /* Align on 32 bit boundary */ \
-} while(0)
+#define ALIGN(a) (((a+sizeof(void*)-1)/sizeof(void*))*sizeof(void*))
+
+//#define ALIGN(idx) do { \
+//  if (idx % sizeof(void*)) \
+//    idx += (sizeof(void*) - idx % sizeof(void*)); /* Align on 32 bit boundary */ \
+//} while(0)
 
 typedef struct {
 	uint32_t address;
@@ -48,6 +51,39 @@ struct curl_write_result {
 	int pos;
 };
 
+static void pack_hostent( /* OUT */ struct hostent *result, char *buffer,
+			 size_t buflen, const char *name, const void *addr)
+{
+	char *aliases, *r_addr, *addrlist;
+	size_t l, idx;
+/* we can't allocate any memory, the buffer is where we need to
+ * * return things we want to use
+ * *
+ * * 1st, the hostname */
+	l = strlen(name);
+	result->h_name = buffer;
+	memcpy(result->h_name, name, l);
+	buffer[l] = '\0';
+	int foo = l + 1;
+	idx = ALIGN(foo);
+/* 2nd, the empty aliases array */
+	aliases = buffer + idx;
+	*(char **) aliases = NULL;
+	idx += sizeof(char *);
+	result->h_aliases = (char **) aliases;
+	result->h_addrtype = AF_INET;
+	result->h_length = sizeof(struct in_addr);
+/* 3rd, address */
+	r_addr = buffer + idx;
+	inet_pton(AF_INET, addr, r_addr);
+	idx += ALIGN(result->h_length);
+/* 4th, the addresses ptr array */
+	addrlist = buffer + idx;
+	((char **) addrlist)[0] = r_addr;
+	((char **) addrlist)[1] = NULL;
+	result->h_addr_list = (char **) addrlist;
+}
+
 static size_t curl_write(char *ptr, size_t size, size_t nmemb, void *userdata) {
 	struct curl_write_result *result = (struct curl_write_result *)userdata;
 
@@ -63,9 +99,12 @@ static size_t curl_write(char *ptr, size_t size, size_t nmemb, void *userdata) {
 }
 
 static int ends_with(const char *name, const char* suffix) {
+#if DEBUG
+	printf( "@ %s:: name=%s suffix=%s\n", __FUNCTION__, name, suffix ) ;
+#endif
 	size_t ln, ls;
-	assert(name);
-	assert(suffix);
+	//assert(name); // causes segfaults? FIXME
+	//assert(suffix);
 
 	if ( (ls = strlen(suffix)) > (ln = strlen(name)) )
 		return 0;
@@ -73,75 +112,32 @@ static int ends_with(const char *name, const char* suffix) {
 	return strcasecmp(name+ln-ls,suffix) == 0;
 }
 
-/**
- * Packs the data from a name/value string into a hostent return
- * struct. "result" must be previously initialized.
- */
-static void pack_hostent(struct hostent *result,
-			 char *buffer,
-			 size_t buflen,
-			 const char *name,
-			 const void *addr)
-{
-	char *aliases, *r_addr, *addrlist;
-	size_t l, idx;
-	/* we can't allocate any memory, the buffer is where we need to
-	 * return things we want to use
-	 *
-	 * 1st, the hostname */
-	l = strlen(name);
-	result->h_name = buffer;
-	memcpy(result->h_name, name, l);
-	buffer[l] = '\0';
-
-	/*idx = ALIGN(l + 1);*/
-
-	/* 2nd, the empty aliases array */
-	aliases = buffer + idx;
-	*(char **) aliases = NULL;
-	idx += sizeof(char *);
-
-	result->h_aliases = (char **) aliases;
-
-	result->h_addrtype = AF_INET;
-	result->h_length = sizeof(struct in_addr);
-
-	/* 3rd, address */
-	r_addr = buffer + idx;
-	inet_pton(AF_INET, addr, r_addr);
-	//idx += ALIGN(result->h_length);
-
-	/* 4th, the addresses ptr array */
-	addrlist = buffer + idx;
-	((char **) addrlist)[0] = r_addr;
-	((char **) addrlist)[1] = NULL;
-
-	result->h_addr_list = (char **) addrlist;
-}
-
-
 /*
  * Given a service name, queries Consul API and returns numeric address
  */
-int curl_lookup(const char *name) {
+static int curl_lookup(const char *name, char *addr) {
 
-	printf( "@ %s\n", __FUNCTION__ ) ;
+#if DEBUG
+	printf( "@ %s::(in) name=%s\n", __FUNCTION__, name ) ;
+#endif
 
 	CURL *curl_handle = curl_easy_init();
 	CURLcode res;
 
 	char *curl_data;
 	char *consul_url;
-	const char *addr;
 	size_t cu_len1, cu_len2;
 
 	/* Create API URL given *name */
 	curl_data = malloc(BUFFER_SIZE);
 	cu_len1 = strlen(CONSUL_URL_BASE);
-	cu_len2 = strlen(name);
+	cu_len2 = (strchr(name, '.')-name); //guaranteed by ends_with
 	consul_url = malloc(cu_len1+cu_len2+1);
 	memcpy(consul_url, CONSUL_URL_BASE, cu_len1);
 	memcpy(consul_url+cu_len1, name, cu_len2);
+#if DEBUG
+	printf( "@ %s::(in) api_url=%s\n", __FUNCTION__, consul_url ) ;
+#endif
 
 	struct curl_write_result wr = {
 		.data = curl_data,
@@ -157,24 +153,35 @@ int curl_lookup(const char *name) {
 	// Parse out the address field only
 	// For now it's lame and only grabs the first one until FIXME
 	json_object *jservicearray = json_tokener_parse(curl_data);
-	json_object *jservice, *jaddr;
-	jaddr = malloc(50); // this is dumb
-	enum json_type type;
+	json_object *jservice;
+	json_object *jaddr;
+	const char *tempaddr;
+	tempaddr = malloc(sizeof(ipv6_address_t));
+	jaddr = malloc(BUFFER_SIZE); // this is dumb
 	int i;
 	for (i=0; i < json_object_array_length(jservicearray) ; i++) {
 		jservice = json_object_array_get_idx(jservicearray, i);
 
 		// We care about the address
-		json_object_object_get_ex(jservice, "Address", &jaddr);
-		addr = json_object_get_string(jaddr);
-		printf("addr %s\n", addr);
+		if (json_object_object_get_ex(jservice, "Address", &jaddr)) {
+			tempaddr = json_object_get_string(jaddr);
+			strcpy(addr, tempaddr);
+		} else {
+			return 1;
+		}
+#if DEBUG
+		printf("@ %s::(out) addr=%s\n", __FUNCTION__, addr);
+#endif
+		return 0;
 	}
+#if DEBUG
+	printf( "@ %s::(out) no 'Address' in json\n", __FUNCTION__ );
+#endif
+	return 1;
 	
 	free(curl_data);
 	curl_easy_cleanup(curl_handle);
 	curl_global_cleanup();
-
-	
 }
 
 
@@ -188,7 +195,9 @@ enum nss_status _nss_consul_gethostbyname_r(const char *name,
 					    int *errnop,
 					    int *h_errnop)
 {
+#if DEBUG
 	printf( "@ %s\n", __FUNCTION__ ) ;
+#endif
 
 	return _nss_consul_gethostbyname2_r(name,
 					    AF_INET,
@@ -214,10 +223,12 @@ enum nss_status _nss_consul_gethostbyname2_r(const char *name,
 					     int *errnop,
 					     int *h_errnop)
 {
-	printf( "@ %s\n", __FUNCTION__ ) ;
+#if DEBUG
+	printf( "@ %s:: name=%s af=%d\n", __FUNCTION__, name, af ) ;
+#endif
 
 	// error checking is for pansies
-	if (af != AF_INET || af != AF_INET6) {
+	if (af != AF_INET) {
 		*errnop = EAGAIN;
 		*h_errnop = NO_RECOVERY;
 		return NSS_STATUS_TRYAGAIN;
@@ -228,23 +239,27 @@ enum nss_status _nss_consul_gethostbyname2_r(const char *name,
 		*h_errnop = NO_RECOVERY;
 		return NSS_STATUS_UNAVAIL;
 	}
-	// ∴ error checking is for me
-	if (buflen < (sizeof(char*) + 
-		      strlen(name) + 1 +
+	// ∴ error checking is for me (disabled)
+/*	if (buflen < (sizeof(char*) +   strlen(name) + 1 +
 		      sizeof(ipv4_address_t) +
 		      sizeof(char*) + 
-		      8 )) {
+	 	      8 )) {
 		*errnop = ERANGE;
+		*h_errnop = NO_RECOVERY;
+		return NSS_STATUS_TRYAGAIN;
+	}*/
+
+	char * ipaddr; 
+	ipaddr = malloc(sizeof(ipv6_address_t));
+
+	int rc = curl_lookup(name, ipaddr);
+	if (rc) {
+		*errnop = EAGAIN;
 		*h_errnop = NO_RECOVERY;
 		return NSS_STATUS_TRYAGAIN;
 	}
 
-	result->h_addrtype = AF_INET;
-	result->h_length = sizeof(ipv4_address_t);
-	
-	//result->h_name = 'c';
-	
-		
+	pack_hostent(result, buffer, buflen, name, ipaddr);
 
 	return NSS_STATUS_SUCCESS;
 }
@@ -259,6 +274,8 @@ enum nss_status _nss_etcd_gethostbyaddr_r(const void *addr, socklen_t len,
 					  int *errnop,
 					  int *h_errnop)
 {
+#if DEBUG
 	printf( "@ %s\n", __FUNCTION__ ) ;
+#endif
 	return NSS_STATUS_UNAVAIL;
 }
