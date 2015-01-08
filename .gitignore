@@ -1,1 +1,3 @@
 *.swp
+libnss_consul.so.2
+test-nss
