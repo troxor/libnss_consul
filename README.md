@@ -16,8 +16,7 @@ This plugin requires json-c and libcurl.
 
 ```
 $ make
-# cp libnss_consul.so.2 /lib/libnss_consul.so.2
-# ln -s /lib/libnss_consul.so.2 /lib/libnss_consul.so
+$ sudo ln -s $(pwd)/libnss_consul.so.2 /lib/
 ```
 
 Then, include "consul" in your /etc/nsswitch.conf files section:

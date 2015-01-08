@@ -147,7 +147,9 @@ static int curl_lookup(const char *name, char *addr) {
 	curl_easy_setopt(curl_handle, CURLOPT_URL, consul_url);
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, curl_write);
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &wr);
-	res = curl_easy_perform(curl_handle);
+	if (curl_easy_perform(curl_handle)) {
+		goto fail;
+	}
 	curl_data[wr.pos] = '\0';
 
 	// Parse out the address field only
@@ -177,11 +179,11 @@ static int curl_lookup(const char *name, char *addr) {
 #if DEBUG
 	printf( "@ %s::(out) no 'Address' in json\n", __FUNCTION__ );
 #endif
-	return 1;
-	
+fail:
 	free(curl_data);
 	curl_easy_cleanup(curl_handle);
 	curl_global_cleanup();
+	return 1;
 }
 
 
