@@ -1,6 +1,8 @@
 libnss_consul
 ===========
 
+[![Build Status](https://drone.io/github.com/troxor/libnss_consul/status.png)](https://drone.io/github.com/troxor/libnss_consul/latest)
+
 A libnss resolver for Consul
 
 The resolver will query the HTTP API of a Consul server to lookup hosts.
